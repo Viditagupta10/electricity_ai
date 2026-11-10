@@ -1,7 +1,4 @@
-"""
-app.py - Streamlit dashboard
-Run:  streamlit run app.py
-"""
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd

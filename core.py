@@ -117,7 +117,7 @@ def load_csv(file):
     c_lot = pick("lot_id", "lot", "parking", "parking_lot", "location", "name", "systemcodenumber")
     c_occ = pick("occupied", "occupancy", "vehicles", "count", "cars")
     if not (c_ts and c_lot and c_occ):
-        raise ValueError("CSV me 'timestamp', 'lot_id' aur 'occupied' columns hone chahiye.")
+        raise ValueError("CSV must include the 'timestamp', 'lot_id', and 'occupied' columns.")
     c_cap, c_rain = pick("capacity", "total", "spaces"), pick("rain", "rain_mm", "precipitation")
     c_hol, c_ev = pick("is_holiday", "holiday"), pick("event")
 
@@ -144,7 +144,7 @@ def load_csv(file):
         for c in ("rain", "is_holiday", "event"):
             h[c] = h[c].fillna(0)
         if len(h) < 24 * 14:
-            raise ValueError(f"'{lot}' ka kam se kam 14 din ka data chahiye.")
+            raise ValueError(f"'{lot}' must have at least 14 days of data.")
         h = h.reset_index()
         h["lot_id"] = lot
         out.append(h)

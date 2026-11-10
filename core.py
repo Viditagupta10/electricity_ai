@@ -1,357 +1,416 @@
 """
-core.py - Smart Electricity Consumption & Optimization System
+core.py - Smart Parking Availability & Prediction System
 All data-science logic lives here (no Streamlit code), so it is easy to test.
+
+Two prediction models:
+  1. SHORT-TERM  (next 1/2/3 hours)  - uses live occupancy + lags
+  2. PLANNING    (any future date)   - uses calendar + weather + events only
 """
 import sqlite3
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor, IsolationForest, RandomForestRegressor
+from sklearn.cluster import KMeans
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.metrics import r2_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-# --------------------------------------------------------------------------
-# 1. TARIFF (slab-wise billing)
-# --------------------------------------------------------------------------
-# (upper_limit_of_slab_in_units, rate_per_unit)  -> edit as per your DISCOM
-DEFAULT_SLABS = [(100, 3.5), (200, 5.0), (400, 7.0), (float("inf"), 9.0)]
-DEFAULT_FIXED = 100.0   # fixed monthly charge (Rs)
-DEFAULT_TAX = 5.0       # electricity duty / tax (%)
+STATUS_LABELS = ["Available", "Filling up", "Almost full"]
+STATUS_BINS = [0.70, 0.90]          # <70% available, 70-90% filling up, >=90% almost full
+HORIZONS = (1, 2, 3)
 
 
-def calc_bill(units, slabs=DEFAULT_SLABS, fixed=DEFAULT_FIXED, tax_pct=DEFAULT_TAX):
-    """Slab-wise bill: each slab's units are charged at that slab's rate."""
-    units = max(float(units), 0.0)
-    energy, prev = 0.0, 0.0
-    for limit, rate in slabs:
-        if units > prev:
-            energy += (min(units, limit) - prev) * rate
-        prev = limit
-    return round((energy + fixed) * (1 + tax_pct / 100), 2)
-
-
-def units_for_budget(budget, slabs=DEFAULT_SLABS, fixed=DEFAULT_FIXED, tax_pct=DEFAULT_TAX):
-    """Inverse of calc_bill: max units you can use to stay within a budget."""
-    lo, hi = 0.0, 5000.0
-    for _ in range(60):  # binary search
-        mid = (lo + hi) / 2
-        if calc_bill(mid, slabs, fixed, tax_pct) <= budget:
-            lo = mid
-        else:
-            hi = mid
-    return round(lo, 1)
+def status_of(rate):
+    return STATUS_LABELS[int(np.digitize(rate, STATUS_BINS))]
 
 
 # --------------------------------------------------------------------------
-# 2. DATA (synthetic demo / CSV loader / SQLite)
+# 1. DATA  (synthetic demo / CSV loader / SQLite)
 # --------------------------------------------------------------------------
-def generate_demo_data(days=730, seed=42, end_date=None):
-    """Realistic daily household data (temperature-driven AC, weekends, spikes)."""
+DEMO_LOTS = [
+    # name, type, capacity, lat, lon
+    ("Tech Park Office", "Office", 300, 28.6139, 77.2090),
+    ("City Mall", "Mall", 500, 28.6200, 77.2200),
+    ("Central Hospital", "Hospital", 200, 28.6080, 77.2150),
+    ("Railway Station", "Station", 250, 28.6280, 77.2060),
+    ("Old Market", "Market", 150, 28.6170, 77.2300),
+]
+
+
+def _g(h, mu, sd):
+    return np.exp(-((h - mu) / sd) ** 2)
+
+
+def _base_profile(kind, h, off_day):
+    """Typical occupancy rate (0-1) by hour for each type of parking lot."""
+    if kind == "Office":
+        return np.where(off_day, 0.10 + 0.10 * _g(h, 13, 4), 0.10 + 0.82 * _g(h, 12, 3.5))
+    if kind == "Mall":
+        return np.where(off_day, 0.25 + 0.65 * _g(h, 16, 4), 0.15 + 0.55 * _g(h, 18, 3))
+    if kind == "Hospital":
+        return (0.35 + 0.45 * _g(h, 11, 4.5)) * np.where(off_day, 0.9, 1.0)
+    if kind == "Station":
+        return np.where(off_day, 0.20 + 0.30 * _g(h, 12, 4),
+                        0.20 + 0.50 * _g(h, 8.5, 1.8) + 0.45 * _g(h, 18.5, 2))
+    return 0.10 + (0.60 + 0.15 * off_day) * _g(h, 19, 2.5)   # Market
+
+
+def generate_demo_data(days=150, seed=7, end=None):
+    """Hourly occupancy for 5 lots with weekday/weekend, holidays, rain and events."""
     rng = np.random.default_rng(seed)
-    end = pd.Timestamp(end_date or pd.Timestamp.today().normalize())
-    dates = pd.date_range(end=end, periods=days, freq="D")
-    doy = dates.dayofyear.values
-    temp = 25 + 11 * np.sin(2 * np.pi * (doy - 105) / 365) + rng.normal(0, 1.8, days)
+    # demo "now" = yesterday 5 PM (busy time, so the live view is interesting)
+    end = pd.Timestamp(end) if end is not None else (pd.Timestamp.today().floor("D") - pd.Timedelta(hours=7))
+    ts = pd.date_range(end=end, periods=days * 24, freq="h")
+    day = ts.floor("D")
+    udays = day.unique()
+    holidays = set(rng.choice(udays[: len(udays) - 1], size=max(3, days // 30), replace=False))
+    rainy = {d: rng.integers(0, 24 - 3) for d in udays if rng.random() < 0.2}   # rain start hour
 
-    ac = np.clip((temp - 26) * 0.9, 0, 10) * 1.3 * rng.uniform(0.8, 1.15, days)
-    fan = 0.075 * 3 * np.clip((temp - 18) * 0.9, 0, 12)
-    fridge = 1.3 + 0.03 * (temp - 25) + rng.normal(0, 0.05, days)
-    geyser = np.where(temp < 20, 2.0 * rng.uniform(0.3, 0.8, days), 0)
-    washing = np.where(rng.random(days) < 0.45, 0.6, 0.0)
-    base = 1.6 + rng.normal(0, 0.15, days)  # lights, TV, charger, misc
-    weekend = np.asarray(dates.dayofweek >= 5)
-    base = base + weekend * 0.8
-    kwh = ac + fan + fridge + geyser + washing + base
+    is_hol = np.array([d in holidays for d in day], dtype=int)
+    off = ((ts.dayofweek >= 5) | (is_hol == 1)).astype(float)
+    hour = ts.hour.values
+    rain = np.zeros(len(ts))
+    for i, (d, hh) in enumerate(zip(day, hour)):
+        st_h = rainy.get(d)
+        if st_h is not None and st_h <= hh < st_h + 3:
+            rain[i] = rng.uniform(2, 8)
 
-    # inject abnormal days (faulty appliance / appliance left ON)
-    idx = rng.choice(np.arange(60, days), size=max(5, days // 90), replace=False)
-    kwh[idx] *= rng.uniform(1.6, 2.1, len(idx))
-    return pd.DataFrame({"date": dates, "kwh": kwh.round(2), "temp": temp.round(1)})
+    frames, meta = [], []
+    for name, kind, cap, lat, lon in DEMO_LOTS:
+        rate = _base_profile(kind, hour.astype(float), off)
+        rate = rate + np.where(rain > 0, -0.12 if kind == "Market" else 0.08, 0.0)
+        ev = np.zeros(len(ts), dtype=int)
+        if kind in ("Mall", "Market", "Station"):       # evening events (sale / festival / big train)
+            for d in udays:
+                if rng.random() < 0.07:
+                    ev[(day == d) & (hour >= 17) & (hour < 22)] = 1
+        rate = rate + 0.25 * ev
+        noise = np.zeros(len(ts))
+        for i in range(1, len(ts)):                      # AR(1) noise -> smooth, realistic
+            noise[i] = 0.8 * noise[i - 1] + rng.normal(0, 0.03)
+        rate = np.clip(rate + noise, 0.02, 1.0)
+        frames.append(pd.DataFrame({
+            "ts": ts, "lot_id": name, "occupied": np.round(rate * cap).astype(int), "capacity": cap,
+            "is_holiday": is_hol, "rain": rain.round(1), "event": ev}))
+        meta.append({"lot_id": name, "type": kind, "capacity": cap, "lat": lat, "lon": lon})
+    df = pd.concat(frames, ignore_index=True)
+    df["rate"] = (df["occupied"] / df["capacity"]).clip(0, 1)
+    return df, pd.DataFrame(meta)
 
 
-def load_csv(file) -> pd.DataFrame:
+def load_csv(file):
     """
-    Accepts:
-      * simple CSV with columns: date, kwh  (optional: temp)
-      * hourly / minute data (auto-aggregated to daily)
-      * UCI 'Household Power Consumption' file (Date, Time, Global_active_power)
-    Returns daily dataframe: date, kwh, [temp]
+    CSV columns (names flexible):
+      timestamp, lot_id, occupied      (required)
+      capacity, rain, is_holiday, event, lat, lon   (optional)
+    Any time-resolution is converted to hourly average per lot.
     """
-    raw = pd.read_csv(file, sep=None, engine="python", na_values=["?", "", "NA"])
+    raw = pd.read_csv(file, sep=None, engine="python")
     raw.columns = [c.strip().lower() for c in raw.columns]
 
-    # --- UCI format ---
-    if "global_active_power" in raw.columns:
-        ts = pd.to_datetime(raw["date"] + " " + raw["time"], dayfirst=True, errors="coerce")
-        kw = pd.to_numeric(raw["global_active_power"], errors="coerce")
-        s = pd.Series((kw / 60.0).values, index=ts).dropna()      # kW per minute -> kWh
-        daily = s.resample("D").sum().rename("kwh").reset_index()
-        daily.columns = ["date", "kwh"]
-        return _finalize(daily)
+    def pick(*names):
+        return next((c for c in raw.columns if c in names), None)
 
-    date_col = next((c for c in raw.columns if c in ("date", "datetime", "timestamp", "time", "day")), None)
-    kwh_col = next((c for c in raw.columns if c in ("kwh", "units", "consumption", "energy", "usage", "unit")), None)
-    if date_col is None or kwh_col is None:
-        raise ValueError("CSV me 'date' aur 'kwh' (ya units/consumption) column hona chahiye.")
-    dates = pd.to_datetime(raw[date_col], errors="coerce")           # ISO (YYYY-MM-DD) first
-    if dates.isna().mean() > 0.2:                                      # fallback: DD/MM/YYYY
-        dates = pd.to_datetime(raw[date_col], errors="coerce", dayfirst=True)
-    df = pd.DataFrame({"date": dates, "kwh": pd.to_numeric(raw[kwh_col], errors="coerce")})
-    temp_col = next((c for c in raw.columns if c in ("temp", "temperature")), None)
-    if temp_col:
-        df["temp"] = pd.to_numeric(raw[temp_col], errors="coerce")
-    df = df.dropna(subset=["date", "kwh"])
-    agg = {"kwh": "sum"}
-    if "temp" in df:
-        agg["temp"] = "mean"
-    daily = df.set_index("date").resample("D").agg(agg).reset_index()
-    return _finalize(daily)
+    c_ts = pick("timestamp", "datetime", "time", "date")
+    c_lot = pick("lot_id", "lot", "parking", "parking_lot", "location", "name", "systemcodenumber")
+    c_occ = pick("occupied", "occupancy", "vehicles", "count", "cars")
+    if not (c_ts and c_lot and c_occ):
+        raise ValueError("CSV me 'timestamp', 'lot_id' aur 'occupied' columns hone chahiye.")
+    c_cap, c_rain = pick("capacity", "total", "spaces"), pick("rain", "rain_mm", "precipitation")
+    c_hol, c_ev = pick("is_holiday", "holiday"), pick("event")
+
+    ts = pd.to_datetime(raw[c_ts], errors="coerce")
+    if ts.isna().mean() > 0.2:
+        ts = pd.to_datetime(raw[c_ts], errors="coerce", dayfirst=True)
+    d = pd.DataFrame({"ts": ts, "lot_id": raw[c_lot].astype(str),
+                      "occupied": pd.to_numeric(raw[c_occ], errors="coerce")})
+    d["capacity"] = pd.to_numeric(raw[c_cap], errors="coerce") if c_cap else np.nan
+    d["rain"] = pd.to_numeric(raw[c_rain], errors="coerce") if c_rain else 0.0
+    d["is_holiday"] = pd.to_numeric(raw[c_hol], errors="coerce") if c_hol else 0.0
+    d["event"] = pd.to_numeric(raw[c_ev], errors="coerce") if c_ev else 0.0
+    d = d.dropna(subset=["ts", "occupied"])
+
+    out, meta = [], []
+    for lot, g in d.groupby("lot_id"):
+        g = g.set_index("ts").sort_index()
+        h = g.resample("h").agg({"occupied": "mean", "capacity": "max", "rain": "mean",
+                                 "is_holiday": "max", "event": "max"})
+        h["occupied"] = h["occupied"].interpolate(limit_direction="both")
+        cap = h["capacity"].max()
+        cap = cap if pd.notna(cap) else float(np.ceil(h["occupied"].max() * 1.1))
+        h["capacity"] = cap
+        for c in ("rain", "is_holiday", "event"):
+            h[c] = h[c].fillna(0)
+        if len(h) < 24 * 14:
+            raise ValueError(f"'{lot}' ka kam se kam 14 din ka data chahiye.")
+        h = h.reset_index()
+        h["lot_id"] = lot
+        out.append(h)
+        row = raw[raw[c_lot].astype(str) == lot]
+        lat = pd.to_numeric(row[pick("lat", "latitude")], errors="coerce").mean() if pick("lat", "latitude") else np.nan
+        lon = pd.to_numeric(row[pick("lon", "lng", "longitude")], errors="coerce").mean() if pick("lon", "lng", "longitude") else np.nan
+        meta.append({"lot_id": lot, "type": "Custom", "capacity": cap, "lat": lat, "lon": lon})
+    df = pd.concat(out, ignore_index=True)
+    df["occupied"] = df["occupied"].round().astype(int)
+    df["rate"] = (df["occupied"] / df["capacity"]).clip(0, 1)
+    return df, pd.DataFrame(meta)
 
 
-def _finalize(daily):
-    daily = daily.sort_values("date").reset_index(drop=True)
-    daily["kwh"] = daily["kwh"].replace(0, np.nan).interpolate(limit_direction="both")
-    if "temp" in daily:
-        daily["temp"] = daily["temp"].interpolate(limit_direction="both")
-    if len(daily) < 90:
-        raise ValueError("Kam se kam 90 din ka data chahiye (better: 1+ saal).")
-    return daily
-
-
-def save_to_sqlite(df, db_path="usage.db", table="daily_usage"):
+def save_to_sqlite(df, db_path="parking.db", table="parking_history"):
     with sqlite3.connect(db_path) as con:
         df.to_sql(table, con, if_exists="replace", index=False)
 
 
-def load_from_sqlite(db_path="usage.db", table="daily_usage"):
+def load_from_sqlite(db_path="parking.db", table="parking_history"):
     with sqlite3.connect(db_path) as con:
-        return pd.read_sql(f"SELECT * FROM {table} ORDER BY date", con, parse_dates=["date"])
-
-
-def monthly_summary(df, slabs=DEFAULT_SLABS, fixed=DEFAULT_FIXED, tax=DEFAULT_TAX):
-    m = df.assign(month=df["date"].dt.to_period("M")).groupby("month").agg(
-        units=("kwh", "sum"), days=("kwh", "count"), avg_daily=("kwh", "mean"))
-    m["bill"] = m["units"].apply(lambda u: calc_bill(u, slabs, fixed, tax))
-    m = m.round(1).reset_index()
-    m["month"] = m["month"].astype(str)
-    return m
+        return pd.read_sql(f"SELECT * FROM {table}", con, parse_dates=["ts"])
 
 
 # --------------------------------------------------------------------------
-# 3. FEATURE ENGINEERING + FORECASTING (time-series split, leakage-free)
+# 2. FEATURES
 # --------------------------------------------------------------------------
-def _feat_row(window, date, temp):
-    """window = last 30 daily values (oldest -> newest). Same fn for train & forecast."""
-    w = np.asarray(window, dtype=float)
-    doy = date.dayofyear
-    row = {
-        "lag1": w[-1], "lag2": w[-2], "lag7": w[-7], "lag14": w[-14],
-        "roll7": w[-7:].mean(), "roll30": w[-30:].mean(),
-        "dow": date.dayofweek, "month": date.month,
-        "is_weekend": int(date.dayofweek >= 5),
-        "doy_sin": np.sin(2 * np.pi * doy / 365.25), "doy_cos": np.cos(2 * np.pi * doy / 365.25),
-    }
-    if temp is not None:
-        row["temp"] = float(temp)
-    return row
+def _calendar(ts):
+    ts = pd.DatetimeIndex(ts)
+    return pd.DataFrame({
+        "hour": ts.hour, "dow": ts.dayofweek, "is_weekend": (ts.dayofweek >= 5).astype(int),
+        "hour_sin": np.sin(2 * np.pi * ts.hour / 24), "hour_cos": np.cos(2 * np.pi * ts.hour / 24),
+        "dow_sin": np.sin(2 * np.pi * ts.dayofweek / 7), "dow_cos": np.cos(2 * np.pi * ts.dayofweek / 7),
+    })
 
 
-def build_features(df):
-    has_temp = "temp" in df.columns and df["temp"].notna().all()
-    vals = df["kwh"].values
-    rows, ys, dts = [], [], []
-    for i in range(30, len(df)):
-        d = df["date"].iloc[i]
-        rows.append(_feat_row(vals[i - 30:i], d, df["temp"].iloc[i] if has_temp else None))
-        ys.append(vals[i])
-        dts.append(d)
-    X = pd.DataFrame(rows)
-    return X, pd.Series(ys, name="kwh"), pd.Series(dts, name="date"), has_temp
+def _lot_onehot(lots, all_lots):
+    return pd.DataFrame({f"lot_{l}": (np.asarray(lots) == l).astype(int) for l in all_lots})
 
 
-def _metrics(y_true, y_pred):
-    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
-    mae = np.mean(np.abs(y_true - y_pred))
-    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
-    mape = np.mean(np.abs((y_true - y_pred) / np.clip(y_true, 1e-6, None))) * 100
-    return round(mae, 3), round(rmse, 3), round(mape, 2)
+def build_short(df, all_lots, h):
+    """Features known at time t  ->  target = occupancy rate at t+h hours."""
+    d = df.sort_values(["lot_id", "ts"]).reset_index(drop=True)
+    g = d.groupby("lot_id")["rate"]
+    d["rate_now"], d["rate_l1"], d["rate_l2"], d["rate_l24"] = d["rate"], g.shift(1), g.shift(2), g.shift(24)
+    d["roll3"] = g.transform(lambda s: s.rolling(3).mean())
+    d["target"] = g.shift(-h)
+    d["t_ts"] = d["ts"] + pd.Timedelta(hours=h)
+    for c in ("is_holiday", "rain", "event"):                 # conditions at the TARGET time
+        d["t_" + c] = d.groupby("lot_id")[c].shift(-h)
+    d = d.dropna(subset=["rate_l1", "rate_l2", "rate_l24", "roll3", "target", "t_rain"]).reset_index(drop=True)
+    X = pd.concat([
+        d[["rate_now", "rate_l1", "rate_l2", "rate_l24", "roll3"]],
+        _calendar(d["t_ts"]),
+        d[["t_is_holiday", "t_rain", "t_event"]].rename(columns=lambda c: c[2:]),
+        _lot_onehot(d["lot_id"], all_lots)], axis=1)
+    return X, d["target"], d["ts"], d["rate_now"]
 
 
+def build_plan(df, all_lots):
+    """Calendar/weather features only (no lags) -> can predict ANY future date/time."""
+    d = df.sort_values(["lot_id", "ts"]).reset_index(drop=True)
+    X = pd.concat([_calendar(d["ts"]), d[["is_holiday", "rain", "event"]].reset_index(drop=True),
+                   _lot_onehot(d["lot_id"], all_lots)], axis=1)
+    return X, d["rate"], d["ts"], d
+
+
+# --------------------------------------------------------------------------
+# 3. MODELS + EVALUATION (chronological split -> no data leakage)
+# --------------------------------------------------------------------------
 def _models():
     return {
         "Linear Regression": make_pipeline(StandardScaler(), LinearRegression()),
-        "Random Forest": RandomForestRegressor(n_estimators=250, min_samples_leaf=2, random_state=42, n_jobs=-1),
-        "Gradient Boosting": GradientBoostingRegressor(n_estimators=250, learning_rate=0.05, max_depth=3, random_state=42),
+        "Random Forest": RandomForestRegressor(n_estimators=150, min_samples_leaf=3, random_state=42, n_jobs=-1),
+        "Gradient Boosting": HistGradientBoostingRegressor(max_iter=250, learning_rate=0.07, random_state=42),
     }
 
 
-def train_and_compare(df, test_frac=0.2):
-    """Chronological split -> compare baseline + 3 models -> refit best on all data."""
-    X, y, dts, has_temp = build_features(df)
-    split = int(len(X) * (1 - test_frac))
-    Xtr, Xte, ytr, yte = X.iloc[:split], X.iloc[split:], y.iloc[:split], y.iloc[split:]
+def evaluate(y_true, y_pred):
+    y_true, y_pred = np.asarray(y_true), np.clip(np.asarray(y_pred), 0, 1)
+    err = y_true - y_pred
+    st_true, st_pred = np.digitize(y_true, STATUS_BINS), np.digitize(y_pred, STATUS_BINS)
+    return {"MAE (pts %)": round(np.mean(np.abs(err)) * 100, 2),
+            "RMSE (pts %)": round(np.sqrt(np.mean(err ** 2)) * 100, 2),
+            "R2": round(r2_score(y_true, y_pred), 3),
+            "Within 10 pts %": round(np.mean(np.abs(err) <= 0.10) * 100, 1),
+            "Status accuracy %": round(np.mean(st_true == st_pred) * 100, 1)}
 
+
+def _time_split(ts, frac=0.2):
+    cut = np.sort(ts.unique())[int(ts.nunique() * (1 - frac))]
+    train = (ts < cut).values
+    return train, ~train
+
+
+def _importance(model, Xte, yte):
+    n = min(2500, len(Xte))
+    idx = np.random.default_rng(0).choice(len(Xte), n, replace=False)
+    r = permutation_importance(model, Xte.iloc[idx], yte.iloc[idx], n_repeats=3, random_state=0, n_jobs=-1)
+    imp = pd.Series(r.importances_mean, index=Xte.columns)
+    lot_cols = [c for c in imp.index if c.startswith("lot_")]
+    imp = pd.concat([imp.drop(lot_cols), pd.Series({"lot (which parking)": imp[lot_cols].sum()})])
+    imp = imp.clip(lower=0)
+    return (imp / imp.sum()).sort_values(ascending=False)
+
+
+def train_short(df, all_lots):
+    # model comparison at horizon = 1 hour
+    X, y, ts, rate_now = build_short(df, all_lots, 1)
+    tr, te = _time_split(ts)
+    rows = [{"Model": "Baseline (persistence: same as now)", **evaluate(y[te], rate_now[te])}]
+    for name, m in _models().items():
+        m.fit(X[tr], y[tr])
+        rows.append({"Model": name, **evaluate(y[te], m.predict(X[te]))})
+    comp = pd.DataFrame(rows).sort_values("MAE (pts %)").reset_index(drop=True)
+    best = comp[~comp["Model"].str.startswith("Baseline")].iloc[0]["Model"]
+
+    # best model for each horizon (1h, 2h, 3h): accuracy table + final refit on all data
+    models, hrows, extra = {}, [], {}
+    for h in HORIZONS:
+        Xh, yh, tsh, rnh = build_short(df, all_lots, h)
+        trh, teh = _time_split(tsh)
+        m = _models()[best].fit(Xh[trh], yh[trh])
+        pred = m.predict(Xh[teh])
+        hrows.append({"Horizon": f"+{h} hour", "Baseline MAE": evaluate(yh[teh], rnh[teh])["MAE (pts %)"],
+                      **evaluate(yh[teh], pred)})
+        if h == 1:
+            extra = {"importance": _importance(m, Xh[teh], yh[teh]),
+                     "test_ts": tsh[teh].values, "test_actual": yh[teh].values,
+                     "test_pred": np.clip(pred, 0, 1)}
+        models[h] = _models()[best].fit(Xh, yh)
+    return {"comparison": comp, "best_name": best, "models": models, "horizon_table": pd.DataFrame(hrows),
+            "features": list(X.columns), **extra}
+
+
+def train_plan(df, all_lots):
+    X, y, ts, d = build_plan(df, all_lots)
+    tr, te = _time_split(ts)
+    # baseline: historical average by (lot, weekday, hour) from TRAIN period only
+    key = d["lot_id"] + "|" + d["ts"].dt.dayofweek.astype(str) + "|" + d["ts"].dt.hour.astype(str)
+    mean_map = y[tr].groupby(key[tr]).mean()
+    base_pred = key[te].map(mean_map).fillna(y[tr].mean())
+    rows = [{"Model": "Baseline (avg of same lot, weekday, hour)", **evaluate(y[te], base_pred)}]
+    for name, m in _models().items():
+        m.fit(X[tr], y[tr])
+        rows.append({"Model": name, **evaluate(y[te], m.predict(X[te]))})
+    comp = pd.DataFrame(rows).sort_values("MAE (pts %)").reset_index(drop=True)
+    best = comp[~comp["Model"].str.startswith("Baseline")].iloc[0]["Model"]
+    m_eval = _models()[best].fit(X[tr], y[tr])
+    imp = _importance(m_eval, X[te], y[te])
+    final = _models()[best].fit(X, y)
+    return {"comparison": comp, "best_name": best, "model": final, "features": list(X.columns), "importance": imp}
+
+
+# --------------------------------------------------------------------------
+# 4. PREDICTION HELPERS
+# --------------------------------------------------------------------------
+def latest_state(df):
+    """Most recent known occupancy for each lot (acts like the 'live sensor' feed)."""
     rows = []
-    mae, rmse, mape = _metrics(yte, Xte["lag7"])
-    rows.append({"Model": "Baseline (same day last week)", "MAE": mae, "RMSE": rmse, "MAPE %": mape})
-    test_preds = {}
-    for name, mdl in _models().items():
-        mdl.fit(Xtr, ytr)
-        pred = mdl.predict(Xte)
-        test_preds[name] = pred
-        mae, rmse, mape = _metrics(yte, pred)
-        rows.append({"Model": name, "MAE": mae, "RMSE": rmse, "MAPE %": mape})
-    results = pd.DataFrame(rows).sort_values("MAPE %").reset_index(drop=True)
-
-    best_name = results[results["Model"] != "Baseline (same day last week)"].iloc[0]["Model"]
-    best = _models()[best_name].fit(X, y)  # refit on full data for real forecasting
-    best_mape = float(results.loc[results["Model"] == best_name, "MAPE %"].iloc[0])
-
-    importance = None
-    est = best.steps[-1][1] if hasattr(best, "steps") else best
-    if hasattr(est, "feature_importances_"):
-        importance = pd.Series(est.feature_importances_, index=X.columns).sort_values(ascending=False)
-    else:
-        importance = pd.Series(np.abs(est.coef_), index=X.columns).sort_values(ascending=False)
-        importance = importance / importance.sum()
-
-    return {
-        "results": results, "best_name": best_name, "best_model": best, "best_mape": best_mape,
-        "features": list(X.columns), "has_temp": has_temp, "importance": importance,
-        "test_dates": dts.iloc[split:].values, "test_actual": yte.values,
-        "test_pred": test_preds[best_name],
-    }
+    for lot, g in df.sort_values("ts").groupby("lot_id"):
+        r = g["rate"].values
+        if len(r) == 0:
+            continue
+        rate_l1 = r[-2] if len(r) >= 2 else r[-1]
+        rate_l2 = r[-3] if len(r) >= 3 else r[-1]
+        rate_l24 = r[-25] if len(r) >= 25 else r[0]
+        rows.append({"lot_id": lot, "ts": g["ts"].iloc[-1], "capacity": g["capacity"].iloc[-1],
+                     "occupied": int(g["occupied"].iloc[-1]), "rate_now": r[-1], "rate_l1": rate_l1,
+                     "rate_l2": rate_l2, "rate_l24": rate_l24, "roll3": np.mean(r[-3:]) if len(r) >= 3 else r.mean()})
+    return pd.DataFrame(rows)
 
 
-def forecast_until(df, model, features, has_temp, end_date):
-    """Recursive day-by-day forecast from last date in df until end_date."""
-    hist = list(df["kwh"].values[-30:])
-    last = df["date"].max()
-    clim = None
-    if has_temp:
-        clim = df.groupby(df["date"].dt.dayofyear)["temp"].mean().reindex(range(1, 367))
-        clim = clim.interpolate(limit_direction="both")
+def predict_short(short, df, all_lots, horizons=HORIZONS, rain=0.0, event=0, holiday=0):
+    st_ = latest_state(df)
     out = []
-    for d in pd.date_range(last + pd.Timedelta(days=1), pd.Timestamp(end_date), freq="D"):
-        t = clim[d.dayofyear] if has_temp else None
-        x = pd.DataFrame([_feat_row(hist[-30:], d, t)])[features]
-        p = float(max(model.predict(x)[0], 0.0))
-        hist.append(p)
-        out.append((d, p))
-    return pd.DataFrame(out, columns=["date", "kwh"])
+    for h in horizons:
+        t_ts = st_["ts"] + pd.Timedelta(hours=h)
+        X = pd.concat([
+            st_[["rate_now", "rate_l1", "rate_l2", "rate_l24", "roll3"]].reset_index(drop=True),
+            _calendar(t_ts),
+            pd.DataFrame({"is_holiday": holiday, "rain": rain, "event": event}, index=range(len(st_))),
+            _lot_onehot(st_["lot_id"], all_lots)], axis=1)[short["features"]]
+        p = np.clip(short["models"][h].predict(X), 0, 1)
+        out.append(pd.DataFrame({"lot_id": st_["lot_id"], "horizon": h, "time": t_ts.values,
+                                 "pred_rate": p, "capacity": st_["capacity"]}))
+    r = pd.concat(out, ignore_index=True)
+    r["pred_free"] = (r["capacity"] * (1 - r["pred_rate"])).round().astype(int)
+    r["status"] = r["pred_rate"].apply(status_of)
+    return r
 
 
-def bill_projection(df, fc_df, mape, budget, slabs, fixed, tax):
-    """Current-month projection (actual so far + forecast) and next-month estimate."""
-    last = df["date"].max()
-    cur = last.to_period("M")
-    nxt = cur + 1
-    cur_actual = df[df["date"].dt.to_period("M") == cur]["kwh"].sum()
-    cur_fc = fc_df[fc_df["date"].dt.to_period("M") == cur]["kwh"].sum()
-    nxt_units = fc_df[fc_df["date"].dt.to_period("M") == nxt]["kwh"].sum()
-    cur_total = cur_actual + cur_fc
-    band = mape / 100.0
-    res = {
-        "current_month": str(cur), "next_month": str(nxt),
-        "cur_actual": round(float(cur_actual), 1), "cur_projected_units": round(float(cur_total), 1),
-        "cur_projected_bill": calc_bill(cur_total, slabs, fixed, tax),
-        "next_units": round(float(nxt_units), 1),
-        "next_bill": calc_bill(nxt_units, slabs, fixed, tax),
-        "next_bill_low": calc_bill(nxt_units * (1 - band), slabs, fixed, tax),
-        "next_bill_high": calc_bill(nxt_units * (1 + band), slabs, fixed, tax),
-        "budget": budget, "budget_units": units_for_budget(budget, slabs, fixed, tax),
-    }
-    res["over_budget"] = res["cur_projected_bill"] > budget
-    res["units_to_cut"] = max(0.0, round(res["cur_projected_units"] - res["budget_units"], 1))
-    return res
-
-
-# --------------------------------------------------------------------------
-# 4. ANOMALY DETECTION (Isolation Forest on residual vs expected usage)
-# --------------------------------------------------------------------------
-def detect_anomalies(df, contamination=0.03):
-    d = df.copy()
-    has_temp = "temp" in d.columns
-    feats = pd.DataFrame({
-        "dow": d["date"].dt.dayofweek, "month": d["date"].dt.month,
-        "doy_sin": np.sin(2 * np.pi * d["date"].dt.dayofyear / 365.25),
-        "doy_cos": np.cos(2 * np.pi * d["date"].dt.dayofyear / 365.25),
-    })
-    if has_temp:
-        feats["temp"] = d["temp"].values
-    expected = cross_val_predict(
-        RandomForestRegressor(n_estimators=200, min_samples_leaf=5, random_state=0, n_jobs=-1),
-        feats, d["kwh"], cv=KFold(5, shuffle=True, random_state=0))
-    d["expected"] = expected
-    d["excess_pct"] = (d["kwh"] - d["expected"]) / d["expected"].clip(lower=0.1) * 100
-    iso = IsolationForest(contamination=contamination, random_state=42)
-    d["iso"] = iso.fit_predict(d[["excess_pct", "kwh"]])
-    d["is_anomaly"] = (d["iso"] == -1) & (d["excess_pct"] > 25)   # only abnormally HIGH usage
-
-    def reason(r):
-        if not r["is_anomaly"]:
-            return ""
-        base = f"{r['kwh']:.1f} kWh vs expected {r['expected']:.1f} (+{r['excess_pct']:.0f}%). "
-        if has_temp and r["temp"] >= 32:
-            return base + "Garmi zyada thi - AC lagatar/zyada chala hoga."
-        if has_temp and r["temp"] <= 15:
-            return base + "Thand thi - geyser/heater zyada chala hoga."
-        return base + "Weather se explain nahi hota - koi appliance ON reh gaya ya kharab (geyser/AC/pump) check karo."
-    d["reason"] = d.apply(reason, axis=1)
+def predict_plan(plan, lot_caps, times, rain=0.0, event=0, holiday=0):
+    """lot_caps: dict lot_id -> capacity.  times: list of Timestamps. Returns long dataframe."""
+    all_lots = [c[4:] for c in plan["features"] if c.startswith("lot_")]
+    rows = [(l, t) for l in lot_caps for t in times]
+    d = pd.DataFrame(rows, columns=["lot_id", "time"])
+    X = pd.concat([_calendar(d["time"]),
+                   pd.DataFrame({"is_holiday": holiday, "rain": rain, "event": event}, index=d.index),
+                   _lot_onehot(d["lot_id"], all_lots)], axis=1)[plan["features"]]
+    d["pred_rate"] = np.clip(plan["model"].predict(X), 0, 1)
+    d["capacity"] = d["lot_id"].map(lot_caps)
+    d["pred_free"] = (d["capacity"] * (1 - d["pred_rate"])).round().astype(int)
+    d["status"] = d["pred_rate"].apply(status_of)
     return d
 
 
-# --------------------------------------------------------------------------
-# 5. APPLIANCES, WHAT-IF, RECOMMENDATIONS
-# --------------------------------------------------------------------------
-def default_appliances():
-    return pd.DataFrame([
-        {"Appliance": "AC",               "Watts": 1500, "Qty": 1, "Hours/day": 6.0},
-        {"Appliance": "Ceiling Fan",      "Watts": 75,   "Qty": 3, "Hours/day": 10.0},
-        {"Appliance": "Refrigerator",     "Watts": 150,  "Qty": 1, "Hours/day": 8.0},   # compressor duty cycle
-        {"Appliance": "Washing Machine",  "Watts": 500,  "Qty": 1, "Hours/day": 0.7},
-        {"Appliance": "LED Lights",       "Watts": 10,   "Qty": 8, "Hours/day": 6.0},
-        {"Appliance": "TV",               "Watts": 100,  "Qty": 1, "Hours/day": 4.0},
-        {"Appliance": "Geyser",           "Watts": 2000, "Qty": 1, "Hours/day": 0.5},
-    ])
+def haversine_km(lat1, lon1, lat2, lon2):
+    p = np.pi / 180
+    a = (np.sin((lat2 - lat1) * p / 2) ** 2
+         + np.cos(lat1 * p) * np.cos(lat2 * p) * np.sin((lon2 - lon1) * p / 2) ** 2)
+    return 12742 * np.arcsin(np.sqrt(a))
 
 
-def appliance_estimate(app_df, actual_monthly_units=None):
-    """kWh/month = Watts x Qty x Hours x 30 / 1000. Optionally calibrate to actual bill units."""
-    a = app_df.copy()
-    a["Est. kWh/month"] = (a["Watts"] * a["Qty"] * a["Hours/day"] * 30 / 1000).round(1)
-    total = a["Est. kWh/month"].sum()
-    if actual_monthly_units and total > 0:
-        a["Calibrated kWh/month"] = (a["Est. kWh/month"] * actual_monthly_units / total).round(1)
-    base = "Calibrated kWh/month" if "Calibrated kWh/month" in a else "Est. kWh/month"
-    a["Share %"] = (a[base] / a[base].sum() * 100).round(1)
-    return a.sort_values(base, ascending=False).reset_index(drop=True), base
-
-
-def what_if(monthly_units, saved_units, slabs, fixed, tax):
-    before = calc_bill(monthly_units, slabs, fixed, tax)
-    after = calc_bill(monthly_units - saved_units, slabs, fixed, tax)
-    return {"before": before, "after": after, "saved_rs": round(before - after, 2),
-            "saved_units": round(saved_units, 1)}
-
-
-def recommendations(app_table, base_col, proj, slabs, fixed, tax, top_n=3):
-    """Appliance-wise, budget-aware tips with Rs savings from 1 hour/day less usage."""
-    tips = []
-    monthly_units = proj["cur_projected_units"]
-    candidates = app_table[~app_table["Appliance"].str.contains("fridge|refrigerator", case=False)]
-    for _, r in candidates.head(top_n).iterrows():
-        one_hr_kwh = r["Watts"] * r["Qty"] * 30 / 1000          # saving of 1 hr/day
-        scale = r[base_col] / r["Est. kWh/month"] if r["Est. kWh/month"] else 1
-        w = what_if(monthly_units, one_hr_kwh * scale, slabs, fixed, tax)
-        tips.append(f"**{r['Appliance']}** ({r['Share %']}% of usage): roz 1 ghanta kam chalane se "
-                    f"~{w['saved_units']} units / ~Rs {w['saved_rs']:.0f} per month bachega.")
-    if proj["over_budget"]:
-        tips.insert(0, f"Is month ka projected bill Rs {proj['cur_projected_bill']:.0f} hai, budget Rs {proj['budget']:.0f} "
-                       f"se zyada. Budget me rehne ke liye ~{proj['units_to_cut']} units kam karne honge.")
+def recommend(pred, meta, dest_lat=None, dest_lon=None):
+    """Rank lots: enough free spots first, then nearest to destination (and less crowded)."""
+    r = pred.merge(meta[["lot_id", "lat", "lon", "type"]], on="lot_id")
+    if dest_lat is not None and r["lat"].notna().all():
+        r["distance_km"] = haversine_km(dest_lat, dest_lon, r["lat"], r["lon"]).round(2)
+        r["walk_min"] = (r["distance_km"] * 12).round().astype(int)      # ~5 km/h
     else:
-        tips.insert(0, f"Aap budget me ho: projected Rs {proj['cur_projected_bill']:.0f} vs budget Rs {proj['budget']:.0f}.")
-    tips.append("AC ko 24-26 C par rakho aur filter saaf rakho; peak shaam ke ghanton me geyser/washing machine avoid karo.")
-    tips.append("Purane tube-light/bulb ko LED se replace karo aur standby par devices ko switch-off karo.")
-    return tips
+        r["distance_km"], r["walk_min"] = 0.0, 0
+    r["score"] = r["distance_km"] + 1.5 * r["pred_rate"]
+    r.loc[r["pred_free"] < 5, "score"] += 100                           # practically full -> push down
+    return r.sort_values("score").reset_index(drop=True)
+
+
+def best_arrival(plan_hourly):
+    """plan_hourly: predict_plan output for ONE lot over many hours -> least crowded hour."""
+    return plan_hourly.loc[plan_hourly["pred_rate"].idxmin()]
+
+
+def dynamic_price(rate, base=20.0):
+    """Demand-based pricing: busier lot -> higher Rs/hour (also nudges people to quieter lots)."""
+    mult = np.select([rate < 0.5, rate < 0.7, rate < 0.85], [0.8, 1.0, 1.25], default=1.5)
+    return np.round(base * mult, 1)
+
+
+# --------------------------------------------------------------------------
+# 5. ANALYTICS
+# --------------------------------------------------------------------------
+def hourly_profile(df):
+    d = df.assign(hour=df["ts"].dt.hour, off=(df["ts"].dt.dayofweek >= 5).astype(int))
+    return d.pivot_table(index="hour", columns=["lot_id", "off"], values="rate", aggfunc="mean")
+
+
+def condition_effect(df):
+    """Average occupancy with / without rain and events (what changes demand?)."""
+    d = df.copy()
+    d["Rain"] = np.where(d["rain"] > 0, "Rain", "No rain")
+    d["Event"] = np.where(d["event"] > 0, "Event", "No event")
+    d["Holiday"] = np.where(d["is_holiday"] > 0, "Holiday", "Normal day")
+    parts = []
+    for col in ("Rain", "Event", "Holiday"):
+        t = d.groupby(["lot_id", col])["rate"].mean().unstack() * 100
+        t["Factor"] = col
+        parts.append(t.reset_index())
+    return parts
+
+
+def cluster_lots(df, k=3):
+    """KMeans on each lot's average 24-hour usage curve -> groups lots with similar behaviour."""
+    prof = df.assign(hour=df["ts"].dt.hour).pivot_table(index="lot_id", columns="hour", values="rate", aggfunc="mean")
+    k = min(k, len(prof))
+    labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(StandardScaler().fit_transform(prof)) \
+        if k > 1 else np.zeros(len(prof), dtype=int)
+    wk = df.assign(off=df["ts"].dt.dayofweek >= 5).groupby(["lot_id", "off"])["rate"].mean().unstack()
+    out = pd.DataFrame({"Peak hour": prof.idxmax(axis=1), "Avg occupancy %": (prof.mean(axis=1) * 100).round(1),
+                        "Weekend/Weekday ratio": (wk[True] / wk[False]).round(2), "Cluster": labels}, index=prof.index)
+    return out.reset_index()

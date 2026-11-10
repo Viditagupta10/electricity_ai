@@ -1,4 +1,7 @@
-
+"""
+app.py - Smart Parking Availability & Prediction System (Streamlit dashboard)
+Run:  streamlit run app.py
+"""
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -7,216 +10,202 @@ import streamlit as st
 
 import core
 
-st.set_page_config(page_title="Smart Electricity Optimizer", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Smart Parking AI", page_icon="🅿️", layout="wide")
 sns.set_theme(style="whitegrid")
-
+ICON = {"Available": "🟢", "Filling up": "🟡", "Almost full": "🔴"}
+COLOR = {"Available": "#2ca02c", "Filling up": "#ff9f1c", "Almost full": "#d62728"}
 
 # ------------------------------------------------------------------ sidebar
-st.sidebar.title("⚡ Settings")
+st.sidebar.title("🅿️ Settings")
 src = st.sidebar.radio("Data source", ["Demo data (synthetic)", "Upload CSV"])
-df = None
+df = meta = None
 if src == "Upload CSV":
-    up = st.sidebar.file_uploader("CSV (date, kwh, [temp]) ya UCI household file", type=["csv", "txt"])
-    st.sidebar.caption("Daily / hourly / minute data - sab chalega (auto daily me convert hoga).")
+    up = st.sidebar.file_uploader("CSV: timestamp, lot_id, occupied (+ optional capacity, rain, event, lat, lon)",
+                                  type=["csv", "txt"])
     if up is not None:
         try:
-            df = core.load_csv(up)
+            df, meta = core.load_csv(up)
         except Exception as e:
             st.sidebar.error(str(e))
 if df is None:
     if src == "Upload CSV":
-        st.sidebar.info("CSV upload hone tak demo data dikha raha hoon.")
-    df = core.generate_demo_data()
+        st.sidebar.info("Showing demo data until a CSV is uploaded.")
+    df, meta = core.generate_demo_data()
 
-st.sidebar.subheader("Tariff (apne DISCOM ke hisaab se)")
-limits = [st.sidebar.number_input(f"Slab {i+1} upto (units)", value=v, step=50)
-          for i, v in enumerate([100, 200, 400])]
-rates = [st.sidebar.number_input(f"Slab {i+1} rate (Rs/unit)", value=v, step=0.5)
-         for i, v in enumerate([3.5, 5.0, 7.0, 9.0])]
-slabs = list(zip(limits + [float("inf")], rates))
-fixed = st.sidebar.number_input("Fixed charge (Rs)", value=100.0, step=10.0)
-tax = st.sidebar.number_input("Tax / duty (%)", value=5.0, step=0.5)
-budget = st.sidebar.number_input("Monthly budget (Rs)", value=1000, step=100)
+st.sidebar.subheader("Conditions (for prediction)")
+rain_on = st.sidebar.checkbox("🌧️ Rain expected", value=False)
+event_on = st.sidebar.checkbox("🎉 Event / sale / festival", value=False)
+holiday_on = st.sidebar.checkbox("📅 Holiday", value=False)
+RAIN, EVENT, HOLIDAY = (5.0 if rain_on else 0.0), int(event_on), int(holiday_on)
+base_price = st.sidebar.number_input("Base parking price (Rs/hour)", value=20.0, step=5.0)
 
-# save history in SQLite (SQL concept)
-core.save_to_sqlite(df, "usage.db")
-
-st.title("⚡ AI-Powered Smart Electricity Consumption & Optimization")
-st.caption(f"Data: {df['date'].min():%d %b %Y} → {df['date'].max():%d %b %Y}  |  "
-           f"{len(df)} days")
-
-# ------------------------------------------------------------------ pipeline
-@st.cache_data(show_spinner="Models train ho rahe hain...")
-def run_pipeline(data: pd.DataFrame):
-    res = core.train_and_compare(data)
-    end = data["date"].max() + pd.offsets.MonthEnd(2)
-    fc = core.forecast_until(data, res["best_model"], res["features"], res["has_temp"], end)
-    an = core.detect_anomalies(data)
-    return res, fc, an
+core.save_to_sqlite(df, "parking.db")          # SQL storage of history
+all_lots = list(meta["lot_id"])
+caps = dict(zip(meta["lot_id"], meta["capacity"]))
 
 
-res, fc, an = run_pipeline(df)
-proj = core.bill_projection(df, fc, res["best_mape"], budget, slabs, fixed, tax)
-monthly = core.monthly_summary(df, slabs, fixed, tax)
-full_months = monthly[monthly["days"] >= 25]
+# ------------------------------------------------------------------ pipeline (cached)
+@st.cache_data(show_spinner="Training models (first run may take 20-30 sec)...")
+def run_pipeline(data: pd.DataFrame, lots: tuple):
+    return core.train_short(data, list(lots)), core.train_plan(data, list(lots))
 
-st.caption(f"Best model: {res['best_name']} (MAPE {res['best_mape']}%)")
+short, plan = run_pipeline(df, tuple(all_lots))
+now_ts = df["ts"].max()
+live = core.predict_short(short, df, all_lots, rain=RAIN, event=EVENT, holiday=HOLIDAY)
+state = core.latest_state(df)
 
-# alert banner (last 7 days)
-recent = an[(an["date"] > df["date"].max() - pd.Timedelta(days=7)) & an["is_anomaly"]]
-if len(recent):
-    st.error(f"🚨 Pichle 7 din me {len(recent)} din abnormal usage mila. Anomalies tab dekho.")
-
+st.title("🅿️ Smart Parking Availability & Prediction System")
+st.caption(f"Data: {df['ts'].min():%d %b %Y} → {now_ts:%d %b %Y %H:%M}  |  {len(all_lots)} parking lots  |  "
+           f"{len(df):,} hourly records  |  'Now' = last data point ({now_ts:%d %b, %I %p})")
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📊 Overview", "🔮 Forecast & Bill", "🔌 Appliances & What-if", "🚨 Anomalies", "🧪 Model Report"])
+    ["📍 Live Status", "🔮 Future Prediction", "🧭 Smart Recommendation", "📊 Analytics", "🧪 Model Report"])
 
-# ------------------------------------------------------------------ TAB 1
+# ------------------------------------------------------------------ TAB 1: LIVE
 with tab1:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total consumption", f"{df['kwh'].sum():,.0f} kWh")
-    c2.metric("Avg / day", f"{df['kwh'].mean():.1f} kWh")
-    peak = full_months.loc[full_months["units"].idxmax()]
-    c3.metric("Highest month", peak["month"], f"{peak['units']:.0f} units")
-    last_full = full_months.iloc[-1]
-    c4.metric(f"Bill ({last_full['month']})", f"Rs {last_full['bill']:,.0f}")
+    st.subheader("How many spaces are free right now?")
+    cols = st.columns(len(state))
+    for col, (_, r) in zip(cols, state.iterrows()):
+        s = core.status_of(r["rate_now"])
+        free = int(r["capacity"] - r["occupied"])
+        col.metric(f"{ICON[s]} {r['lot_id']}", f"{free} free", f"{r['rate_now']*100:.0f}% full", delta_color="off")
+        col.progress(float(min(r["rate_now"], 1.0)))
 
-    st.subheader("Daily usage")
-    fig, ax = plt.subplots(figsize=(11, 3.4))
-    ax.plot(df["date"], df["kwh"], alpha=0.35, label="Daily")
-    ax.plot(df["date"], df["kwh"].rolling(7).mean(), color="C1", label="7-day avg")
-    ax.set_ylabel("kWh"); ax.legend()
+    st.subheader("Availability forecast for the next 1-3 hours")
+    piv = live.pivot(index="lot_id", columns="horizon", values="pred_free")
+    pst = live.pivot(index="lot_id", columns="horizon", values="status")
+    table = pd.DataFrame({f"+{h} hr": [f"{ICON[pst.loc[l, h]]} {piv.loc[l, h]} free" for l in piv.index]
+                          for h in core.HORIZONS}, index=piv.index)
+    table.insert(0, "Now", [f"{ICON[core.status_of(state.set_index('lot_id').loc[l, 'rate_now'])]} "
+                             f"{int(state.set_index('lot_id').loc[l, 'capacity'] - state.set_index('lot_id').loc[l, 'occupied'])} free"
+                             for l in piv.index])
+    st.dataframe(table, use_container_width=True)
+
+    fig, ax = plt.subplots(figsize=(10, 3.6))
+    for lot in all_lots:
+        pts = [state.set_index("lot_id").loc[lot, "rate_now"] * 100] + \
+              list(live[live["lot_id"] == lot].sort_values("horizon")["pred_rate"] * 100)
+        ax.plot([0, 1, 2, 3], pts, marker="o", label=lot)
+    ax.axhline(90, color="red", ls="--", lw=1); ax.set_xticks([0, 1, 2, 3], ["Now", "+1h", "+2h", "+3h"])
+    ax.set_ylabel("Occupancy %"); ax.legend(ncol=5, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, 1.18))
     st.pyplot(fig); plt.close(fig)
+    st.caption("Short-term model: current occupancy + recent hourly trend + weather/event signals.")
 
-    colA, colB = st.columns(2)
-    with colA:
-        st.subheader("Monthly comparison")
-        fig, ax = plt.subplots(figsize=(6, 3.6))
-        sns.barplot(data=full_months.tail(12), x="month", y="units", ax=ax, color="C0")
-        ax.tick_params(axis="x", rotation=60); ax.set_xlabel("")
-        st.pyplot(fig); plt.close(fig)
-    with colB:
-        st.subheader("Weekly pattern (avg kWh)")
-        wd = df.assign(day=df["date"].dt.day_name()).groupby("day")["kwh"].mean()
-        order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        fig, ax = plt.subplots(figsize=(6, 3.6))
-        sns.barplot(x=wd.reindex(order).index.str[:3], y=wd.reindex(order).values, ax=ax, color="C2")
-        ax.set_ylabel("kWh")
-        st.pyplot(fig); plt.close(fig)
-
-    st.subheader("Month × weekday heatmap")
-    hm = df.assign(m=df["date"].dt.month, d=df["date"].dt.dayofweek).pivot_table(
-        index="m", columns="d", values="kwh", aggfunc="mean")
-    hm.columns = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][: len(hm.columns)]
-    fig, ax = plt.subplots(figsize=(8, 4))
-    sns.heatmap(hm, cmap="YlOrRd", annot=True, fmt=".1f", ax=ax)
-    ax.set_ylabel("Month")
-    st.pyplot(fig); plt.close(fig)
-
-    st.subheader("Monthly table")
-    st.dataframe(monthly.rename(columns={"units": "Units (kWh)", "bill": "Bill (Rs)",
-                                         "avg_daily": "Avg/day", "days": "Days"}), use_container_width=True)
-
-# ------------------------------------------------------------------ TAB 2
+# ------------------------------------------------------------------ TAB 2: PLANNING
 with tab2:
-    st.subheader(f"Next month ({proj['next_month']}) estimated bill")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Predicted units", f"{proj['next_units']:.0f} kWh")
-    c2.metric("Predicted bill", f"Rs {proj['next_bill']:,.0f}")
-    c3.metric("Likely range", f"Rs {proj['next_bill_low']:,.0f} - {proj['next_bill_high']:,.0f}")
+    st.subheader("Plan for any day or date")
+    c1, c2 = st.columns(2)
+    lot = c1.selectbox("Parking lot", all_lots)
+    day = c2.date_input("Date", value=(now_ts + pd.Timedelta(days=1)).date())
+    hrs = st.slider("Time window", 0, 23, (6, 22))
+    times = [pd.Timestamp(day) + pd.Timedelta(hours=h) for h in range(hrs[0], hrs[1] + 1)]
+    pp = core.predict_plan(plan, {lot: caps[lot]}, times, rain=RAIN, event=EVENT, holiday=HOLIDAY)
+    best = core.best_arrival(pp)
+    worst = pp.loc[pp["pred_rate"].idxmax()]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Least crowded time", f"{best['time']:%I %p}", f"{best['pred_free']} spots free", delta_color="off")
+    m2.metric("Busiest time", f"{worst['time']:%I %p}", f"{worst['pred_rate']*100:.0f}% full", delta_color="off")
+    pick = st.select_slider("When would you like to arrive?", options=list(pp["time"]),
+                            format_func=lambda t: f"{t:%I %p}", value=pp["time"].iloc[len(pp) // 2])
+    pr = pp[pp["time"] == pick].iloc[0]
+    m3.metric(f"{pick:%I %p}", f"{ICON[pr['status']]} {pr['status']}",
+              f"{pr['pred_free']} free | Rs {core.dynamic_price(pr['pred_rate'], base_price)}/hr", delta_color="off")
 
-    st.subheader(f"Budget tracker - {proj['current_month']}")
-    d1, d2, d3 = st.columns(3)
-    d1.metric("Units so far", f"{proj['cur_actual']:.0f} kWh")
-    d2.metric("Month-end projected bill", f"Rs {proj['cur_projected_bill']:,.0f}")
-    d3.metric("Budget", f"Rs {budget:,.0f}", delta=f"{budget - proj['cur_projected_bill']:,.0f}")
-    st.progress(min(proj["cur_projected_bill"] / max(budget, 1), 1.0))
-    if proj["over_budget"]:
-        st.warning(f"Budget cross hone wala hai. ~{proj['units_to_cut']} units kam karne honge "
-                   f"(budget = max {proj['budget_units']} units).")
-    else:
-        st.success("Is rate par aap budget ke andar rahoge. 👍")
-
-    st.subheader("Forecast (next ~2 months)")
-    fig, ax = plt.subplots(figsize=(11, 3.4))
-    hist = df.tail(60)
-    ax.plot(hist["date"], hist["kwh"], label="Actual")
-    ax.plot(fc["date"], fc["kwh"], color="C3", label="Forecast")
-    ax.set_ylabel("kWh"); ax.legend()
+    fig, ax = plt.subplots(figsize=(10, 3.6))
+    ax.bar(pp["time"].dt.strftime("%H:%M"), pp["pred_rate"] * 100, color=[COLOR[s] for s in pp["status"]])
+    ax.axhline(90, color="red", ls="--", lw=1); ax.set_ylabel("Predicted occupancy %")
+    ax.tick_params(axis="x", rotation=60)
     st.pyplot(fig); plt.close(fig)
+    if lot and best["pred_rate"] < 0.7:
+        st.success(f"Tip: visit {lot} around **{best['time']:%I %p}** for the most available spaces.")
+    st.caption("The planning model predicts using only the calendar (hour, weekday, holiday), weather, and events, "
+               "so it works for any future date.")
 
-    st.subheader("Kaunse factors usage badhate hain?")
-    imp = res["importance"].head(8)[::-1]
-    fig, ax = plt.subplots(figsize=(7, 3.4))
-    ax.barh(imp.index, imp.values, color="C4")
-    ax.set_xlabel("Importance")
-    st.pyplot(fig); plt.close(fig)
-    if res["has_temp"] is False:
-        st.info("Temperature column nahi hai - CSV me 'temp' add karoge to accuracy badhegi.")
-
-# ------------------------------------------------------------------ TAB 3
+# ------------------------------------------------------------------ TAB 3: RECOMMEND
 with tab3:
-    st.subheader("Appliance-wise estimate")
-    st.caption("Formula: Watts × Qty × Hours/day × 30 ÷ 1000. Table edit karo - apne ghar ke numbers daalo.")
-    if "apps" not in st.session_state:
-        st.session_state["apps"] = core.default_appliances()
-    edited = st.data_editor(st.session_state["apps"], num_rows="dynamic", use_container_width=True, key="ed")
-    edited = edited.dropna().reset_index(drop=True)
-    calibrate = st.checkbox("Actual units se calibrate karo (recommended)", value=True)
-    atab, base = core.appliance_estimate(
-        edited, proj["cur_projected_units"] if calibrate else None) if len(edited) else (None, None)
+    st.subheader("Which parking lot is best?")
+    h = st.radio("How many hours from now will you arrive?", list(core.HORIZONS), format_func=lambda x: f"{x} hours later",
+                 horizontal=True)
+    has_geo = meta["lat"].notna().all()
+    dest_lat = dest_lon = None
+    if has_geo:
+        dest_name = st.selectbox("Landmark near your destination", all_lots)
+        dm = meta.set_index("lot_id").loc[dest_name]
+        dest_lat, dest_lon = float(dm["lat"]), float(dm["lon"])
+    else:
+        st.info("No lat/lon data was found in the CSV, so ranking is based only on availability.")
+    rec = core.recommend(live[live["horizon"] == h], meta, dest_lat, dest_lon)
+    top = rec.iloc[0]
+    if top["pred_free"] >= 5:
+        msg = (f"👉 **{top['lot_id']}** is the best option: ~{top['pred_free']} spots free expected "
+               f"({top['status']})")
+        if has_geo:
+            msg += f", {top['distance_km']} km from the destination (~{top['walk_min']} min walk)"
+        st.success(msg + f". Price: Rs {core.dynamic_price(top['pred_rate'], base_price)}/hr")
+    else:
+        st.error("At that time, most lots appear nearly full. Try a little earlier or later.")
+    show = rec.assign(Status=rec["status"].map(lambda s: f"{ICON[s]} {s}"),
+                      **{"Free spots": rec["pred_free"], "Occupancy %": (rec["pred_rate"] * 100).round(0),
+                         "Rs/hr": core.dynamic_price(rec["pred_rate"].values, base_price)})
+    cols_show = ["lot_id", "Status", "Free spots", "Occupancy %", "Rs/hr"] + (["distance_km", "walk_min"] if has_geo else [])
+    st.dataframe(show[cols_show].rename(columns={"lot_id": "Parking lot"}), use_container_width=True)
+    st.caption("Ranking = first by available spaces, then by proximity to the destination and lower crowding. "
+               "Dynamic pricing: the busier the lot, the higher the rate.")
 
-    if atab is not None:
-        top = atab.iloc[0]
-        st.success(f"Sabse zyada bijli: **{top['Appliance']}** ({top['Share %']}%)")
-        cA, cB = st.columns([1, 1])
-        with cA:
-            st.dataframe(atab[["Appliance", base, "Share %"]], use_container_width=True)
-        with cB:
-            fig, ax = plt.subplots(figsize=(5, 4))
-            ax.pie(atab[base], labels=atab["Appliance"], autopct="%1.0f%%", startangle=90)
+# ------------------------------------------------------------------ TAB 4: ANALYTICS
+with tab4:
+    prof = core.hourly_profile(df)
+    st.subheader("Hourly pattern: weekday vs weekend")
+    sel = st.selectbox("Lot", all_lots, key="an_lot")
+    fig, ax = plt.subplots(figsize=(9, 3.4))
+    ax.plot(prof.index, prof[(sel, 0)] * 100, label="Weekday", marker="o")
+    ax.plot(prof.index, prof[(sel, 1)] * 100, label="Weekend", marker="o")
+    ax.set_xlabel("Hour"); ax.set_ylabel("Avg occupancy %"); ax.legend()
+    st.pyplot(fig); plt.close(fig)
+
+    st.subheader("Heatmap: day × hour")
+    hm = df[df["lot_id"] == sel].assign(h=lambda d: d["ts"].dt.hour, d=lambda d: d["ts"].dt.dayofweek) \
+        .pivot_table(index="d", columns="h", values="rate", aggfunc="mean") * 100
+    hm.index = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][: len(hm)]
+    fig, ax = plt.subplots(figsize=(11, 3.4))
+    sns.heatmap(hm, cmap="YlOrRd", ax=ax, cbar_kws={"label": "% full"})
+    st.pyplot(fig); plt.close(fig)
+
+    st.subheader("Impact of rain / event / holiday (avg occupancy %)")
+    eff = core.condition_effect(df)
+    cc = st.columns(3)
+    for c, t in zip(cc, eff):
+        c.caption(t["Factor"].iloc[0])
+        c.dataframe(t.drop(columns="Factor").round(1).set_index("lot_id"), use_container_width=True)
+
+    st.subheader("Lots with similar behavior (KMeans clustering)")
+    st.dataframe(core.cluster_lots(df).set_index("lot_id"), use_container_width=True)
+
+# ------------------------------------------------------------------ TAB 5: MODEL REPORT
+with tab5:
+    st.subheader("1) Short-term model (+1 hour) - comparison")
+    st.dataframe(short["comparison"], use_container_width=True)
+    st.caption("Time-based split: first 80% of days for training, last 20% for testing (no data leakage). "
+               "MAE 'pts %' = average error in occupancy %. Baseline = 'same as it is now'.")
+    st.subheader("2) Horizon-wise accuracy")
+    st.dataframe(short["horizon_table"], use_container_width=True)
+    st.subheader("3) Planning model (any future date) - comparison")
+    st.dataframe(plan["comparison"], use_container_width=True)
+    st.caption("Baseline = same lot, same weekday, same hour historical average.")
+
+    c1, c2 = st.columns(2)
+    for c, title, imp in ((c1, "Short-term: what matters most", short["importance"]),
+                          (c2, "Planning: what matters most", plan["importance"])):
+        with c:
+            st.caption(title)
+            top_imp = imp.head(8)[::-1]
+            fig, ax = plt.subplots(figsize=(5, 3.2))
+            ax.barh(top_imp.index, top_imp.values, color="C4")
             st.pyplot(fig); plt.close(fig)
 
-        st.subheader("🎛️ What-if simulator")
-        w1, w2 = st.columns(2)
-        pick = w1.selectbox("Appliance", atab["Appliance"])
-        cut = w2.slider("Roz kitne ghante kam?", 0.0, 8.0, 1.0, 0.5)
-        r = atab[atab["Appliance"] == pick].iloc[0]
-        scale = r[base] / r["Est. kWh/month"] if r["Est. kWh/month"] else 1
-        saved = min(r["Watts"] * r["Qty"] * cut * 30 / 1000 * scale, r[base])
-        wi = core.what_if(proj["cur_projected_units"], saved, slabs, fixed, tax)
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Units saved", f"{wi['saved_units']} kWh")
-        m2.metric("New bill", f"Rs {wi['after']:,.0f}", delta=f"-Rs {wi['saved_rs']:,.0f}", delta_color="inverse")
-        m3.metric("Yearly saving", f"Rs {wi['saved_rs'] * 12:,.0f}")
-
-        st.subheader("💡 Smart recommendations")
-        for t in core.recommendations(atab, base, proj, slabs, fixed, tax):
-            st.markdown(f"- {t}")
-
-# ------------------------------------------------------------------ TAB 4
-with tab4:
-    st.subheader("Abnormal usage detection (Isolation Forest)")
-    st.caption("Model pehle weather/calendar se 'expected' usage nikalta hai, phir jo din expected se bahut upar ho use flag karta hai.")
-    flagged = an[an["is_anomaly"]]
-    st.metric("Flagged days", len(flagged))
-    fig, ax = plt.subplots(figsize=(11, 3.6))
-    ax.plot(an["date"], an["kwh"], alpha=0.5, label="Usage")
-    ax.plot(an["date"], an["expected"], color="C2", alpha=0.6, label="Expected")
-    ax.scatter(flagged["date"], flagged["kwh"], color="red", zorder=5, label="Anomaly")
-    ax.legend(); ax.set_ylabel("kWh")
-    st.pyplot(fig); plt.close(fig)
-    show = flagged[["date", "kwh", "expected", "excess_pct", "reason"]].sort_values("date", ascending=False)
-    show = show.assign(date=show["date"].dt.date, expected=show["expected"].round(1),
-                       excess_pct=show["excess_pct"].round(0))
-    st.dataframe(show, use_container_width=True)
-
-# ------------------------------------------------------------------ TAB 5
-with tab5:
-    st.subheader("Model comparison (time-based split: pehle 80% train, last 20% test)")
-    st.dataframe(res["results"], use_container_width=True)
-    st.caption("Baseline = 'pichle hafte same din jitna use hua tha'. Model ko baseline se behtar hona chahiye.")
-    fig, ax = plt.subplots(figsize=(11, 3.4))
-    ax.plot(res["test_dates"], res["test_actual"], label="Actual (test)")
-    ax.plot(res["test_dates"], res["test_pred"], label=f"Predicted ({res['best_name']})", alpha=0.85)
-    ax.legend(); ax.set_ylabel("kWh")
+    st.subheader("Actual vs Predicted (+1h, test period, last 5 days)")
+    td = pd.DataFrame({"ts": short["test_ts"], "actual": short["test_actual"], "pred": short["test_pred"]})
+    g = td.groupby("ts").mean().tail(24 * 5)
+    fig, ax = plt.subplots(figsize=(11, 3.2))
+    ax.plot(g.index, g["actual"] * 100, label="Actual"); ax.plot(g.index, g["pred"] * 100, label="Predicted", alpha=0.85)
+    ax.set_ylabel("Avg occupancy % (all lots)"); ax.legend()
     st.pyplot(fig); plt.close(fig)
